@@ -124,6 +124,23 @@ impl SearchResult {
         Self { row_ids, scores }
     }
 
+    /// Merge shard results in one pass, preserving the first score and order per row ID.
+    pub(crate) fn merge_all(results: &[Self]) -> Self {
+        let capacity = results.iter().map(Self::len).sum();
+        let mut row_ids = Vec::with_capacity(capacity);
+        let mut scores = Vec::with_capacity(capacity);
+        let mut seen = std::collections::HashSet::with_capacity(capacity);
+        for result in results {
+            for (&row_id, &score) in result.row_ids.iter().zip(&result.scores) {
+                if seen.insert(row_id) {
+                    row_ids.push(row_id);
+                    scores.push(score);
+                }
+            }
+        }
+        Self { row_ids, scores }
+    }
+
     /// Return top-k results by score (descending).
     pub fn top_k(&self, k: usize) -> Self {
         // Always sort best-first, even when no truncation is needed (len <= k):
@@ -295,6 +312,24 @@ mod tests {
 
         assert_eq!(merged.row_ids, vec![1, 2, 3]);
         assert_eq!(merged.scores, vec![0.4, 0.5, 0.6]);
+    }
+
+    #[test]
+    fn test_search_result_merge_all() {
+        assert!(SearchResult::merge_all(&[]).is_empty());
+        assert!(
+            SearchResult::merge_all(&[SearchResult::empty(), SearchResult::empty()]).is_empty()
+        );
+
+        let merged = SearchResult::merge_all(&[
+            SearchResult::new(vec![3, 1, 3], vec![0.4, 0.5, 0.9]),
+            SearchResult::empty(),
+            SearchResult::new(vec![1, 2], vec![0.8, 0.6]),
+            SearchResult::new(vec![2, 4, 3], vec![1.0, 0.7, 0.1]),
+        ]);
+
+        assert_eq!(merged.row_ids, vec![3, 1, 2, 4]);
+        assert_eq!(merged.scores, vec![0.4, 0.5, 0.6, 0.7]);
     }
 
     #[test]

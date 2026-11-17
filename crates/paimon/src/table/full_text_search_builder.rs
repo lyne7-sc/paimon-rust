@@ -432,9 +432,7 @@ async fn evaluate_full_text_search_with_executor(
                 .try_collect::<Vec<_>>()
                 .await?
         };
-        for r in &results {
-            merged = merged.or(r);
-        }
+        merged = SearchResult::merge_all(&results);
     }
 
     if evaluation.source_splits.is_some()

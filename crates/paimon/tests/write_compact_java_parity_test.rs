@@ -615,3 +615,30 @@ async fn automatic_compaction_does_not_rewrite_an_untouched_bucket() {
         vec![(1, 10), (2, 20), (10, 100), (20, 200)]
     );
 }
+
+#[tokio::test]
+async fn full_compaction_automatic_respects_triggers_and_publishes_changelogs() {
+    let table = table(
+        false,
+        "1",
+        &[
+            ("changelog-producer", "full-compaction"),
+            ("num-levels", "3"),
+            ("num-sorted-run.compaction-trigger", "2"),
+            ("compaction.max-size-amplification-percent", "0"),
+        ],
+    )
+    .await;
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    assert_eq!(latest(&table).await.commit_kind(), &CommitKind::APPEND);
+    assert_eq!(latest(&table).await.changelog_record_count(), None);
+    write_batch(&table, &make_batch(vec![2], vec![20])).await;
+    let full = latest(&table).await;
+    assert_eq!(full.commit_kind(), &CommitKind::COMPACT);
+    assert_eq!(full.changelog_record_count(), Some(2));
+    write_batch(&table, &make_batch(vec![1], vec![11])).await;
+    let updated = latest(&table).await;
+    assert_eq!(updated.commit_kind(), &CommitKind::COMPACT);
+    assert_eq!(updated.changelog_record_count(), Some(2));
+    assert_eq!(rows(&table).await, vec![(1, 11), (2, 20)]);
+}

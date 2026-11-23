@@ -489,7 +489,8 @@ async fn compact_refuses_unsupported_tables_invalid_options_and_foreign_tasks() 
         assert!(table.new_compact_builder().new_executor().is_err());
     }
     let pk = table(pk_schema(&[("changelog-producer", "full-compaction")])).await;
-    assert!(pk.new_compact_builder().new_planner().is_err());
+    assert!(pk.new_compact_builder().new_planner().is_ok());
+    assert!(pk.new_compact_builder().new_executor().is_ok());
     let table = table(schema(&[])).await;
     let invalid_size =
         table.copy_with_options(HashMap::from([("target-file-size".into(), "0b".into())]));

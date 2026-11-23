@@ -16,6 +16,7 @@
 // under the License.
 
 pub(in crate::table) mod deletion_vectors;
+pub(super) mod full_changelog;
 pub(super) mod indexes;
 pub(super) mod lookup;
 pub(super) mod lookup_file;
@@ -69,6 +70,7 @@ impl PrimaryKeyCompactPlanner {
             || options.merge_engine()? == MergeEngine::FirstRow
             || options.deletion_vectors_enabled();
         for ((partition, bucket, total_buckets), files) in split_files_by_bucket(source) {
+            planner::validate_levels(&context.schema, files.iter())?;
             for file in &files {
                 validate_file(file, true)?;
             }
@@ -108,9 +110,17 @@ impl PrimaryKeyCompactPlanner {
             // One positive level is already a non-overlapping sorted run,
             // including when the previous compaction rolled several files.
             let first_level = files.first().map(|file| file.level);
+            let full_pending =
+                if options.try_changelog_producer()? == ChangelogProducer::FullCompaction {
+                    let max_level = planner::max_level(context.schema.options())?;
+                    first_level.is_some_and(|level| level < max_level)
+                } else {
+                    false
+                };
             if files
                 .iter()
                 .any(|file| file.level == 0 || Some(file.level) != first_level)
+                || full_pending
             {
                 tasks.push(CompactTask {
                     context: context.clone(),
@@ -157,9 +167,11 @@ impl MergeFunction for CompactDeduplicate {
 /// Ordinary compaction preserves singleton states as Java's reducer wrapper
 /// does. Lookup compaction always runs the reducer, including for one retract.
 /// Persist synthesized DELETEs when their state can safely be replayed.
+/// Full output may drop retract states but must still preserve live merge state.
 struct CompactReducer {
     inner: Box<dyn MergeFunction>,
     reduce_singletons: bool,
+    drop_retracts: bool,
     reject_delete_state: bool,
     reject_retract_group: bool,
 }
@@ -188,6 +200,16 @@ impl MergeFunction for CompactReducer {
             // Some aggregators preserve flags or raw DELETE payloads that a
             // single physical INSERT/DELETE cannot encode, even if the final
             // merged row is an INSERT. Leave this group in its source files.
+            if self.drop_retracts {
+                let result = self.inner.merge(rows, batches, columns, schema)?;
+                // Full compaction need not serialize a deleted state, but a
+                // live result still has to be replayable by subsequent writes.
+                if lookup::live_row(lookup::result_row(&result, batches, columns, schema)?)?
+                    .is_none()
+                {
+                    return Ok(MergeResult::Omit);
+                }
+            }
             return Err(crate::Error::Unsupported {
                 message: "Compaction cannot preserve aggregate state for this retract group".into(),
             });
@@ -253,6 +275,9 @@ fn new_merge_function(
         return Ok(Box::new(CompactDeduplicate));
     }
     let inner = KeyValueFileReader::new_unwrapped_merge_function(config, fields)?;
+    let options = crate::spec::CoreOptions::new(&config.table_options);
+    let drop_retracts = options.try_changelog_producer()? == ChangelogProducer::FullCompaction
+        && output_level == planner::max_level(&config.table_options)?;
     let aggregate_functions = match config.merge_engine {
         MergeEngine::PartialUpdate => crate::spec::PartialUpdateConfig::new(&config.table_options)
             .validated_aggregate_functions(&config.table_fields, &config.primary_keys)?
@@ -296,7 +321,9 @@ fn new_merge_function(
                 .table_options
                 .get("changelog-producer")
                 .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
-            reject_delete_state: config.merge_engine == MergeEngine::PartialUpdate
+            drop_retracts,
+            reject_delete_state: !drop_retracts
+                && config.merge_engine == MergeEngine::PartialUpdate
                 && !crate::spec::CoreOptions::new(&config.table_options).ignore_delete()
                 && !aggregate_functions.is_empty(),
             reject_retract_group: !(config.merge_engine == MergeEngine::PartialUpdate
@@ -388,13 +415,17 @@ pub(super) async fn execute(
     let schema = table.schema();
     let options = schema.core_options();
     let lookup_changelog = options.try_changelog_producer()? == ChangelogProducer::Lookup;
-    let output_level = task.output_level();
+    let output_level = task.output_level()?;
+    let full_changelog = options.try_changelog_producer()? == ChangelogProducer::FullCompaction
+        && output_level == planner::max_level(schema.options())?;
     let drop_delete = options.deletion_vectors_enabled() && output_level > 0;
     let reader = new_reader(table, resources.clone())?.with_lookup(lookup);
     let mut batches =
         reader.read_with_merge_function(std::slice::from_ref(split), move |config, fields| {
             if lookup_changelog {
                 lookup::new_merge_function(config, fields, output_level)
+            } else if full_changelog {
+                full_changelog::new_merge_function(config, fields, output_level)
             } else {
                 new_merge_function(config, fields, output_level)
             }
@@ -446,7 +477,7 @@ pub(super) async fn execute(
         file_compression: options.file_compression(),
         file_compression_zstd_level: options.file_compression_zstd_level(),
         write_buffer_size: options.write_buffer_size()? as i64,
-        level: task.output_level(),
+        level: output_level,
         file_source: 1,
         is_changelog: false,
         index_options: index.as_ref(),

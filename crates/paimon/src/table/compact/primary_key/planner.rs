@@ -31,10 +31,7 @@ pub(in crate::table::compact) fn enabled(schema: &TableSchema) -> Result<bool> {
     let options = schema.core_options();
     let producer = options.try_changelog_producer()?;
     Ok(match options.merge_engine()? {
-        MergeEngine::Deduplicate => matches!(
-            producer,
-            ChangelogProducer::None | ChangelogProducer::Input | ChangelogProducer::Lookup
-        ),
+        MergeEngine::Deduplicate => true,
         MergeEngine::FirstRow => {
             !options.deletion_vectors_enabled()
                 && matches!(
@@ -46,10 +43,9 @@ pub(in crate::table::compact) fn enabled(schema: &TableSchema) -> Result<bool> {
             !options.deletion_vectors_enabled()
                 && match producer {
                     ChangelogProducer::Lookup => true,
-                    ChangelogProducer::None | ChangelogProducer::Input => {
-                        plain_state_mergeable(schema)?
-                    }
-                    _ => false,
+                    ChangelogProducer::None
+                    | ChangelogProducer::Input
+                    | ChangelogProducer::FullCompaction => plain_state_mergeable(schema)?,
                 }
         }
     })
@@ -141,6 +137,29 @@ fn mergeable_field(schema: &TableSchema, field: &DataField, function: &str) -> b
     }
 }
 
+/// Only full output may reach this level and become published changelog state.
+pub(in crate::table::compact) fn max_level(
+    properties: &std::collections::HashMap<String, String>,
+) -> Result<i32> {
+    let trigger = integer_option(properties, "num-sorted-run.compaction-trigger", 5, 1)?;
+    Ok(integer_option(properties, "num-levels", trigger.saturating_add(1), 2)? - 1)
+}
+
+pub(in crate::table::compact) fn validate_levels<'a>(
+    schema: &TableSchema,
+    mut files: impl Iterator<Item = &'a DataFileMeta>,
+) -> Result<()> {
+    if schema.core_options().try_changelog_producer()? == ChangelogProducer::FullCompaction {
+        let max_level = max_level(schema.options())?;
+        if files.any(|file| file.level > max_level) {
+            return Err(crate::Error::Unsupported {
+                message: "Full-compaction input level exceeds configured num-levels".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(in crate::table::compact) fn select(
     files: Vec<DataFileMeta>,
     properties: &std::collections::HashMap<String, String>,
@@ -156,12 +175,7 @@ pub(in crate::table::compact) fn select_with_force_level_zero(
     force_level_zero: bool,
 ) -> Result<Option<(Vec<DataFileMeta>, i32)>> {
     let strategy = UniversalCompaction::from_options(properties, "")?;
-    let configured_levels = integer_option(
-        properties,
-        "num-levels",
-        strategy.trigger.saturating_add(1),
-        2,
-    )?;
+    let configured_levels = max_level(properties)? + 1;
     let levels = configured_levels.max(
         files
             .iter()

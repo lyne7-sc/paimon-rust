@@ -26,6 +26,9 @@ mod engine_tests;
 #[path = "pk_compact/lookup_changelog.rs"]
 mod lookup_changelog_tests;
 
+#[path = "pk_compact/full_changelog.rs"]
+mod full_changelog_tests;
+
 #[path = "pk_compact/incremental_planning.rs"]
 mod incremental_planning_tests;
 
@@ -581,7 +584,6 @@ async fn pk_compaction_rolls_ordered_files_and_rebuilds_indexes_with_level_stats
 #[tokio::test]
 async fn pk_compaction_refuses_partial_buckets_and_unsupported_layouts() {
     for options in [
-        vec![("changelog-producer", "full-compaction")],
         vec![
             ("merge-engine", "first-row"),
             ("pk-clustering-override", "true"),

@@ -72,8 +72,7 @@ pub(in crate::table::compact) fn validate_options(options: &HashMap<String, Stri
 struct LookupChangelogMergeFunction {
     inner: Box<dyn MergeFunction>,
     first_row: bool,
-    options: ChangelogOptions,
-    value_columns: Vec<usize>,
+    changelog: ChangelogGenerator,
 }
 
 pub(super) fn new_merge_function(
@@ -81,11 +80,23 @@ pub(super) fn new_merge_function(
     fields: &[DataField],
     output_level: i32,
 ) -> Result<Box<dyn MergeFunction>> {
-    let options = ChangelogOptions::parse(&config.table_options)?;
     Ok(Box::new(LookupChangelogMergeFunction {
         inner: super::new_merge_function(config, fields, output_level)?,
         first_row: config.merge_engine == MergeEngine::FirstRow,
-        value_columns: fields
+        changelog: ChangelogGenerator::new(config, fields)?,
+    }))
+}
+
+/// Shared event filtering and value comparison for generated changelogs.
+pub(super) struct ChangelogGenerator {
+    options: ChangelogOptions,
+    value_columns: Vec<usize>,
+}
+
+impl ChangelogGenerator {
+    pub(super) fn new(config: &KeyValueReadConfig, fields: &[DataField]) -> Result<Self> {
+        let options = ChangelogOptions::parse(&config.table_options)?;
+        let value_columns = fields
             .iter()
             .enumerate()
             .filter(|(_, field)| {
@@ -96,12 +107,15 @@ pub(super) fn new_merge_function(
                     && !options.ignored_fields.contains(field.name())
             })
             .map(|(index, _)| index)
-            .collect(),
-        options,
-    }))
+            .collect();
+        Ok(Self {
+            options,
+            value_columns,
+        })
+    }
 }
 
-fn source_row(
+pub(super) fn source_row(
     batch_idx: usize,
     row_idx: usize,
     batches: &[BufferedBatch],
@@ -123,7 +137,7 @@ fn source_row(
         .map_err(|error| invalid(format!("Invalid lookup value: {error}")))
 }
 
-fn result_row(
+pub(super) fn result_row(
     result: &MergeResult,
     batches: &[BufferedBatch],
     columns: &[usize],
@@ -140,7 +154,7 @@ fn result_row(
     }
 }
 
-fn live_row(batch: Option<RecordBatch>) -> Result<Option<RecordBatch>> {
+pub(super) fn live_row(batch: Option<RecordBatch>) -> Result<Option<RecordBatch>> {
     match batch {
         Some(batch) => {
             let kinds = batch
@@ -338,6 +352,17 @@ impl MergeFunction for LookupChangelogMergeFunction {
                 .transpose()?,
         )?;
         let after = live_row(result_row(&result, batches, columns, schema)?)?;
+        Ok((result, self.changelog.generate(before, after, schema)?))
+    }
+}
+
+impl ChangelogGenerator {
+    pub(super) fn generate(
+        &self,
+        before: Option<RecordBatch>,
+        after: Option<RecordBatch>,
+        schema: &SchemaRef,
+    ) -> Result<Option<RecordBatch>> {
         let mut changes = Vec::with_capacity(2);
         match (&before, &after) {
             (None, Some(after)) => changes.push(with_kind(after, RowKind::Insert)?),
@@ -367,7 +392,7 @@ impl MergeFunction for LookupChangelogMergeFunction {
                     .map_err(|error| invalid(error.to_string()))?,
             )
         };
-        Ok((result, changelog))
+        Ok(changelog)
     }
 }
 

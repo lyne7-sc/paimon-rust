@@ -438,7 +438,10 @@ impl KeyValueFileReader {
             || config
                 .table_options
                 .get("changelog-producer")
-                .is_some_and(|value| value.eq_ignore_ascii_case("lookup"));
+                .is_some_and(|value| {
+                    value.eq_ignore_ascii_case("lookup")
+                        || value.eq_ignore_ascii_case("full-compaction")
+                });
         Self {
             file_io,
             config,

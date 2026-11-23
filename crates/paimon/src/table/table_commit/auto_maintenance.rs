@@ -324,7 +324,11 @@ impl TableCommit {
                     options.merge_engine()?,
                     crate::spec::MergeEngine::PartialUpdate | crate::spec::MergeEngine::Aggregation
                 )
-                && options.try_changelog_producer()? != crate::spec::ChangelogProducer::Lookup;
+                && !matches!(
+                    options.try_changelog_producer()?,
+                    crate::spec::ChangelogProducer::Lookup
+                        | crate::spec::ChangelogProducer::FullCompaction
+                );
             let prepared = match crate::table::compact::execute_auto_plan(
                 &compact.table,
                 &plan,
@@ -335,7 +339,7 @@ impl TableCommit {
             {
                 Ok(prepared) => prepared,
                 // These valid raw states have no lossless compact encoding.
-                // Lookup errors must still propagate to preserve changelog delivery.
+                // Generated changelog errors must propagate to preserve delivery.
                 Err(crate::Error::Unsupported { .. }) if plain_stateful => return Ok(()),
                 Err(error) => return Err(error),
             };

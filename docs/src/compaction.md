@@ -431,9 +431,9 @@ reads share this codec check, including when a type is changed back later.
 
 The same API compacts primary-key tables with `deduplicate`,
 `first-row`, `partial-update` or `aggregation` merge engines. Changelog producers
-`none`, `input` and `lookup` are supported; `first-row` supports `none` or `lookup`.
-For `deduplicate` with `none`, `input` or `lookup`, and non-DV `first-row` with
-`none` or `lookup`, the planner chooses incremental sorted runs using Java's
+`none`, `input`, `lookup` and `full-compaction` are supported; `first-row` supports
+`none` or `lookup`. For non-DV `deduplicate` with any producer, and non-DV
+`first-row` with `none` or `lookup`, the planner chooses incremental sorted runs using Java's
 universal-compaction size and count policy. Each L0 file is a
 run; all files at one positive level form a single run. Normal size and run-count
 triggers take precedence. If they select no work, explicit compaction forces
@@ -448,8 +448,9 @@ The policy uses `num-sorted-run.compaction-trigger` (default `5`), `num-levels`
 `compaction.max-size-amplification-percent` (default `200`). When selected runs
 reach the oldest run, output goes to the highest configured or existing level;
 otherwise it goes immediately below the next unselected run. Explicit full
-compaction is not exposed. Without deletion vectors, `deduplicate` outputs retain winning retracts, so older values
-in untouched files do not reappear after a delete or out-of-order update.
+compaction is not exposed. Except for highest-level `full-compaction` output,
+non-DV `deduplicate` outputs retain winning retracts, so older values in untouched
+files do not reappear after a delete or out-of-order update.
 
 For `first-row`, both producers require actual catalog/FileIO local-cache.
 The executor looks up keys in retained higher-level files. Existing accepted keys
@@ -481,7 +482,7 @@ nearest retained positive-level state into each changed key's merge, in sequence
 order. The output contains the materialized state; lookup scans use only the
 nearest positive-level state, so retained older levels are not aggregated again.
 
-With `none` or `input`, these engines use incremental selection only when every
+With `none`, `input` or `full-compaction`, these engines use incremental selection only when every
 value field can be merged again independently of row order: `min`, `max`,
 `bool_and`, `bool_or`, or integer `sum` without checked overflow. Aggregation must
 have `aggregation.remove-record-on-delete=false` and no global sequence fields.
@@ -491,9 +492,10 @@ functions. Each group's ordering fields retain its winning sequence and must
 not also be protected fields. These modes merge only selected inputs, leaving
 retained history to ordinary query merging, and do not require local-cache.
 
-Other `none`/`input` configurations retain their previous selection: every active
+Other configurations of these producers use complete-bucket rewrites: every active
 file in the selected bucket participates, and output uses the highest input level
-or level 1 for all-L0 inputs. This preserves sparse overwrite and order-sensitive
+or level 1 for all-L0 inputs (`full-compaction` always uses the highest configured
+level). This preserves sparse overwrite and order-sensitive
 state such as `first_value`, finite floating-point summation, checked-overflow
 behavior and reset-on-delete semantics. Existing retract/state restrictions still
 apply. Append size and count options do not control PK selection.
@@ -506,8 +508,9 @@ before execution. Prepared results can still be published if their file changes
 match the captured selection; already committed results remain recoverable
 through the existing idempotent retry path.
 
-Compaction uses each engine's existing merge function and persists its merge
-state, including original sequence metadata and synthesized DELETE records:
+Intermediate compaction and the `none`, `input` and `lookup` producers use each
+engine's existing merge function and persist its merge state, including original
+sequence metadata and synthesized DELETE records:
 
 - `deduplicate` retains the winning record, including retracts that must still
   suppress later out-of-order values.
@@ -641,6 +644,44 @@ or a cache unable to retain the generated file, fail execution without publishin
 a snapshot. Reduce `read.batch-size` for oversized input batches or increase the
 appropriate budget. Cache storage is charged separately to `local-cache.max-size`.
 `lookup.cache-spill-compression` accepts `none`, `zstd` (default), `lz4` or `lzo`.
+
+## Full-compaction changelog producer
+
+Set `changelog-producer=full-compaction` to publish changes between successive
+full-compaction results. It supports fixed and dynamic bucket tables with
+`deduplicate`, `partial-update` or `aggregation`, without deletion vectors or
+a local-cache requirement.
+
+Only compaction into the highest configured level produces changelogs. The
+planner retains its ordinary size and run-count policy: an explicit compaction
+may write an intermediate level and publish no events. Intermediate output keeps
+the state needed by the next merge. Complete-bucket stateful rewrites use the
+highest configured level. Input files above the configured `num-levels` are
+rejected rather than choosing a level that initial streaming scans would miss.
+
+For each key, the previous highest-level row is the before image. The merge
+function combines all selected versions to obtain the after image. Newly live
+keys emit `INSERT`; removed keys emit `DELETE` with the old values; existing keys
+with new input emit an update pair. Keys represented only by their previous
+highest-level row emit nothing. Intermediate source updates can collapse into
+one change, or disappear when a new key is deleted before full compaction.
+
+Full output uses the query reducer's singleton behavior and drops retractions
+from data, including when every key is deleted. Stateful replay restrictions
+above still apply to live full output. A deleted aggregate state need not be
+serialized and can be dropped after reducing the complete bucket. Before images keep the historical sequence
+metadata, and after images use the merged result's metadata.
+
+The changelog filters and file options described for `lookup` also apply.
+Data and changelog files are streamed, rolled and published atomically in a
+`COMPACT` snapshot, with the same cleanup and retry behavior. Batch incremental
+`Changelog` / `Auto` scans and streaming follow-up scans read the changelog
+manifest. Initial streaming scans read only the highest level; pending changes
+in lower levels become visible in a later full-compaction changelog.
+
+Automatic compaction honors the ordinary triggers and `write-only` setting.
+Explicit forced full compaction, periodic scheduling and
+`full-compaction.delta-commits` scheduling are not exposed by Rust core.
 
 ## Dynamic buckets
 
@@ -863,8 +904,7 @@ supporting managed BLOBs does not force compaction after every write.
 
 ## Current scope
 
-The `full-compaction` changelog producer is unsupported. Primary-key deletion-vector
-compaction supports `deduplicate` with `none`, `input` or `lookup`.
+Primary-key deletion-vector compaction supports `deduplicate` with `none`, `input` or `lookup`.
 Outside Data Evolution mode, row tracking, append-table dedicated BLOB storage,
 and dedicated vector storage are unsupported. Primary-key managed BLOB storage
 is supported as described above; tables containing only inline BLOB descriptors

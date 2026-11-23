@@ -644,6 +644,7 @@ impl CompactExecutor {
             });
         }
         if let CompactRound::PrimaryKey(maintenance) = round {
+            let output_level = task.output_level()?;
             let mut deletions = None;
             let lookup = if let Some(cache) = &self.lookup_cache {
                 let history = active
@@ -652,7 +653,7 @@ impl CompactExecutor {
                         entry.partition() == task.partition
                             && entry.bucket() == task.bucket
                             && entry.total_buckets() == task.total_buckets
-                            && entry.file().level > task.output_level()
+                            && entry.file().level > output_level
                     })
                     .map(|entry| entry.file().clone())
                     .collect::<Vec<_>>();
@@ -801,11 +802,21 @@ impl CompactTask {
         !self.context.schema.primary_keys().is_empty()
     }
 
-    fn output_level(&self) -> i32 {
+    fn output_level(&self) -> Result<i32> {
         if let Some(output_level) = self.output_level {
-            return output_level;
+            return Ok(output_level);
         }
-        if self.is_primary_key() {
+        if self.is_primary_key()
+            && self
+                .context
+                .schema
+                .core_options()
+                .try_changelog_producer()?
+                == ChangelogProducer::FullCompaction
+        {
+            return primary_key::planner::max_level(self.context.schema.options());
+        }
+        Ok(if self.is_primary_key() {
             self.files
                 .iter()
                 .map(|file| file.level)
@@ -814,7 +825,7 @@ impl CompactTask {
                 .max(1)
         } else {
             0
-        }
+        })
     }
 
     async fn validate_inputs(&self, table: &Table, active: &[ManifestEntry]) -> Result<()> {
@@ -837,6 +848,12 @@ impl CompactTask {
             })
             .map(|entry| (entry.file().file_name.as_str(), entry))
             .collect::<HashMap<_, _>>();
+        if self.is_primary_key() {
+            primary_key::planner::validate_levels(
+                &self.context.schema,
+                bucket_files.values().map(|entry| entry.file()),
+            )?;
+        }
         if self.is_primary_key() && primary_key::planner::enabled(&self.context.schema)? {
             let selected = primary_key::planner::select(
                 bucket_files
@@ -950,6 +967,17 @@ pub(super) fn validate_primary_key_changes(
         }
     }
     let incremental = primary_key::planner::enabled(schema)?;
+    if schema.core_options().try_changelog_producer()? == ChangelogProducer::FullCompaction {
+        let max_level = primary_key::planner::max_level(schema.options())?;
+        if changelog
+            .iter()
+            .any(|entry| entry.file().level != max_level)
+        {
+            return Err(invalid(
+                "Full-compaction changelogs require highest-level output",
+            ));
+        }
+    }
     let mut output_levels = HashMap::new();
     for (key, removed) in inputs {
         let files = active
@@ -958,16 +986,23 @@ pub(super) fn validate_primary_key_changes(
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
+        primary_key::planner::validate_levels(schema, files.iter())?;
         let (selected, output_level) = if incremental {
             primary_key::planner::select(files, schema.options())?
                 .ok_or_else(|| invalid("No incremental PK compaction is eligible"))?
         } else {
-            let level = files
-                .iter()
-                .map(|file| file.level)
-                .max()
-                .unwrap_or(0)
-                .max(1);
+            let level = if schema.core_options().try_changelog_producer()?
+                == ChangelogProducer::FullCompaction
+            {
+                primary_key::planner::max_level(schema.options())?
+            } else {
+                files
+                    .iter()
+                    .map(|file| file.level)
+                    .max()
+                    .unwrap_or(0)
+                    .max(1)
+            };
             (files, level)
         };
         let expected = selected
@@ -1081,7 +1116,16 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             .sum::<u64>();
         // Missing PK task metadata must not block valid prepared file changes;
         // their output level is checked against the captured selection at commit.
-        let output_level = if task.is_primary_key() {
+        let output_level = if task.is_primary_key()
+            && task
+                .context
+                .schema
+                .core_options()
+                .try_changelog_producer()?
+                == ChangelogProducer::FullCompaction
+        {
+            Some(task.output_level()?)
+        } else if task.is_primary_key() {
             task.output_level
         } else {
             Some(0)
@@ -1118,20 +1162,25 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
         }
         let options = task.context.schema.core_options();
         let dv = task.is_primary_key() && options.deletion_vectors_enabled();
+        let full = task.is_primary_key()
+            && options.try_changelog_producer()? == ChangelogProducer::FullCompaction
+            && task.output_level()?
+                == primary_key::planner::max_level(task.context.schema.options())?;
         // First-row can leave every accepted key in retained history, even
         // with ignore-delete=false, and therefore produce no data files.
         let can_omit_keys = dv
+            || full
             || (task.is_primary_key()
                 && (options.merge_engine()? == MergeEngine::FirstRow
                     || (options.ignore_delete()
                         && options.merge_engine()? == MergeEngine::PartialUpdate)));
-        if dv
+        if (dv || full)
             && result.files.iter().any(|file| {
-                file.delete_row_count != Some(0) || file.row_count > i64::from(u32::MAX) + 1
+                file.delete_row_count != Some(0) || (dv && file.row_count > i64::from(u32::MAX) + 1)
             })
         {
             return Err(invalid(
-                "Deletion-vector compaction data must contain only add records",
+                "Deletion-vector and full compaction data must contain only add records",
             ));
         }
         let updates = result
@@ -1158,9 +1207,9 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             ));
         }
         let lookup = options.try_changelog_producer()? == ChangelogProducer::Lookup;
-        if !lookup && !result.changelog_files.is_empty() {
+        if !lookup && !full && !result.changelog_files.is_empty() {
             return Err(invalid(
-                "Only lookup compaction may produce changelog files",
+                "Only lookup or full compaction may produce changelog files",
             ));
         }
         let mut changelog_rows = 0u64;
@@ -1188,15 +1237,16 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
                 2,
             ));
         }
-        let l0_rows = task
+        let changed_level = if full { task.output_level()? } else { 1 };
+        let changed_rows = task
             .files
             .iter()
-            .filter(|file| file.level == 0)
+            .filter(|file| file.level < changed_level)
             .map(|file| file.row_count as u64)
             .sum::<u64>();
-        if changelog_rows > l0_rows.saturating_mul(2) {
+        if changelog_rows > changed_rows.saturating_mul(2) {
             return Err(invalid(
-                "Lookup changelogs must be generated by level-0 records",
+                "Compaction changelogs exceed the number of changed input records",
             ));
         }
         let part = result.metrics();
@@ -1307,10 +1357,6 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
     }
     if !table.schema().primary_keys().is_empty()
         && (options.bucket() == 0
-            || !matches!(
-                options.try_changelog_producer()?,
-                ChangelogProducer::None | ChangelogProducer::Input | ChangelogProducer::Lookup
-            )
             || (options.merge_engine()? == MergeEngine::FirstRow
                 && !matches!(
                     options.try_changelog_producer()?,
@@ -1318,7 +1364,7 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
                 )))
     {
         return Err(Error::Unsupported {
-            message: "PK compaction requires fixed or dynamic buckets and changelog-producer=none, input or lookup; first-row requires changelog-producer=none or lookup".into(),
+            message: "PK compaction requires fixed or dynamic buckets and changelog-producer=none, input, lookup or full-compaction; first-row requires changelog-producer=none or lookup".into(),
         });
     }
     if options.deletion_vectors_enabled() && options.merge_engine()? != MergeEngine::Deduplicate {
@@ -1326,8 +1372,19 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
             message: "Primary-key deletion-vector compaction requires deduplicate".into(),
         });
     }
-    if options.try_changelog_producer()? == ChangelogProducer::Lookup {
+    if matches!(
+        options.try_changelog_producer()?,
+        ChangelogProducer::Lookup | ChangelogProducer::FullCompaction
+    ) {
         primary_key::lookup::validate_options(properties)?;
+    }
+    if options.try_changelog_producer()? == ChangelogProducer::FullCompaction {
+        primary_key::planner::max_level(properties)?;
+        if options.deletion_vectors_enabled() {
+            return Err(Error::Unsupported {
+                message: "Full-compaction changelog does not support deletion vectors".into(),
+            });
+        }
     }
     options.validate_data_file_path_directory()
 }
